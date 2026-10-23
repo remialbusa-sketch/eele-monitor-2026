@@ -447,6 +447,11 @@ async function main() {
 
   if (options.cloud) {
     try {
+      const env = getEnv();
+      if (!(env.TELEGRAM_BOT_TOKEN || '').trim()) throw new Error('TELEGRAM_BOT_TOKEN secret is missing');
+      if (!(env.TELEGRAM_CHAT_ID || '').trim()) throw new Error('TELEGRAM_CHAT_ID secret is missing');
+      const me = await telegram('getMe');
+      log(`Telegram bot ready: @${me.username}`);
       await runCloud(cfg);
     } catch (error) {
       log(`Cloud check failed: ${error.message}`);
