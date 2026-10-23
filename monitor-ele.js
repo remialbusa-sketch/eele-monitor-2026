@@ -199,23 +199,24 @@ function chunkText(lines, limit = TELEGRAM_LIMIT) {
   return chunks;
 }
 
-function buildMessages(meta, gPassers, pageUrl) {
-  const header = [
-    `EELE October 2026 passers with surname starting with "${meta.prefix}"`,
-    `${gPassers.length} found out of ${meta.totalPassers} passers listed.`,
-    pageUrl,
-  ].join('\n');
-  const rows = gPassers.map((p) => `${p.seq}. ${p.surname}, ${p.given}`);
-  const chunks = rows.length ? chunkText(rows) : [''];
+function buildMessages(meta, gPassers) {
+  const title = `EELE Oct 2026 · ${meta.prefix} surnames`;
+  const summary = `${withCommas(gPassers.length)} of ${withCommas(meta.totalPassers)} passers`;
+  const width = gPassers.reduce((widest, p) => Math.max(widest, String(p.seq).length), 0);
+  const rows = gPassers.length
+    ? gPassers.map((p) => `  ${String(p.seq).padStart(width)}. ${p.surname}, ${p.given}`)
+    : ['  No passers with this surname initial.'];
+  const chunks = chunkText(rows);
   return chunks.map((chunk, index) => {
-    const prefix = chunks.length > 1 ? `Part ${index + 1}/${chunks.length}\n` : '';
-    return `${index === 0 ? `${header}\n\n` : ''}${prefix}${chunk}`.trimEnd();
+    const part = chunks.length > 1 ? ` (${index + 1}/${chunks.length})` : '';
+    const head = index === 0 ? `${title}${part}\n${summary}` : `${title}${part}`;
+    return `${head}\n\n${chunk}`;
   });
 }
 
-async function sendList(meta, gPassers, pageUrl) {
+async function sendList(meta, gPassers) {
   const chatId = await resolveChatId();
-  const messages = buildMessages(meta, gPassers, pageUrl);
+  const messages = buildMessages(meta, gPassers);
   for (const message of messages) {
     await telegram('sendMessage', {
       chat_id: chatId,
@@ -276,7 +277,7 @@ async function runOnce(options, cfg) {
   log(`Found ${passers.length} passers, ${gPassers.length} matching "${cfg.prefix}". Saved ${TXT_FILE} and ${JSON_FILE}.`);
   if (!options.noSend) {
     try {
-      const messages = await sendList(meta, gPassers, cfg.pageUrl);
+      const messages = await sendList(meta, gPassers);
       log(`Sent ${messages} Telegram message(s).`);
     } catch (error) {
       log(`Telegram delivery failed: ${error.message}`);
@@ -324,6 +325,18 @@ function manilaTime(date = new Date()) {
     timeStyle: 'medium',
     timeZone: 'Asia/Manila',
   }).format(date);
+}
+
+function manilaClock(date = new Date()) {
+  return new Intl.DateTimeFormat('en-PH', {
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: 'Asia/Manila',
+  }).format(date);
+}
+
+function withCommas(value) {
+  return Number(value).toLocaleString('en-US');
 }
 
 function intervalLabel(ms) {
@@ -380,7 +393,7 @@ async function deliverList(cfg, passers, stateFile) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const messages = await sendList(meta, gPassers, cfg.pageUrl);
+      const messages = await sendList(meta, gPassers);
       fs.writeFileSync(stateFile, `${JSON.stringify({
         source: cfg.pageUrl,
         deliveredAt: meta.detectedAt,
@@ -433,30 +446,34 @@ async function runLive(cfg) {
     return;
   }
 
-  const runUrl = (getEnv().GITHUB_RUN_URL || '').trim();
   const deadline = Date.now() + cfg.maxHours * 3600 * 1000;
+  const watch = `checking every ${intervalLabel(cfg.pollMs)}`;
   const alerted = new Set();
   let lastModified = null;
   let lastStatus = 'The first page check has not finished yet.';
+  let shortStatus = `Not released yet · ${watch}`;
   let lastCheckedAt = null;
   let lastSig = null;
   let checks = 0;
   let missingNotices = 0;
   let backoffMs = 0;
-  let firstPing = true;
 
-  async function alertOnce(key, title, body) {
+  async function sendMessage(text) {
+    const chatId = await resolveChatId();
+    await telegram('sendMessage', { chat_id: chatId, text, disable_web_page_preview: true });
+  }
+
+  async function alertOnce(key, title, body, withLink = false) {
     if (key !== null && alerted.has(key)) return;
     if (key !== null) alerted.add(key);
-    const message = [
-      `EELE alert: ${title}`,
-      `Checked: ${lastCheckedAt ? manilaTime(lastCheckedAt) : manilaTime()} (Asia/Manila)`,
+    const text = [
+      `EELE Oct 2026 · ${manilaClock(lastCheckedAt || new Date())}`,
+      title,
       body,
-      runUrl ? `Run details: ${runUrl}` : '',
+      withLink ? cfg.pageUrl : '',
     ].filter(Boolean).join('\n');
     try {
-      const chatId = await resolveChatId();
-      await telegram('sendMessage', { chat_id: chatId, text: message, disable_web_page_preview: true });
+      await sendMessage(text);
       log(`Alert sent: ${title}`);
     } catch (error) {
       if (key !== null) alerted.delete(key);
@@ -466,18 +483,8 @@ async function runLive(cfg) {
 
   async function ping() {
     if (readSentState(cfg).state) return true;
-    const message = [
-      firstPing ? 'EELE monitor ping - live on GitHub Actions' : 'EELE monitor ping',
-      `Checked: ${lastCheckedAt ? manilaTime(lastCheckedAt) : 'starting now'} (Asia/Manila)`,
-      `Page: ${lastStatus}`,
-      lastModified ? `Page last modified: ${manilaTime(new Date(lastModified))}` : '',
-      `Checks: every ${intervalLabel(cfg.pollMs)} (${checks} so far). Pings: every ${intervalLabel(cfg.heartbeatMs)}.`,
-      `This runner hands off at ${manilaTime(new Date(deadline))}; the next one is already queued.`,
-      firstPing && runUrl ? `Run details: ${runUrl}` : '',
-    ].filter(Boolean).join('\n');
     try {
-      const chatId = await resolveChatId();
-      await telegram('sendMessage', { chat_id: chatId, text: message, disable_web_page_preview: true });
+      await sendMessage(`EELE Oct 2026 · ${manilaClock(lastCheckedAt || new Date())}\n${shortStatus}`);
       log(`Ping sent after ${checks} check(s): ${lastStatus}`);
       return true;
     } catch (error) {
@@ -493,16 +500,16 @@ async function runLive(cfg) {
     } catch (error) {
       backoffMs = backoffMs ? Math.min(backoffMs * 2, 300000) : 60000;
       lastStatus = `Page check failed: ${error.message}`;
+      shortStatus = `Checks failing · retrying in ${intervalLabel(backoffMs)}`;
       log(`${lastStatus}. Backing off to ${intervalLabel(backoffMs)}.`);
-      await alertOnce('fetch-failing', 'page checks are failing',
-        `${error.message}. Backing off to ${intervalLabel(backoffMs)} between checks; I will report when they resume.`);
+      await alertOnce('fetch-failing', `CHECKS FAILING · ${error.message}`, `Retrying in ${intervalLabel(backoffMs)}.`);
       return backoffMs;
     }
 
     if (backoffMs) {
       backoffMs = 0;
       alerted.delete('fetch-failing');
-      await alertOnce(null, 'page checks resumed', 'Checks are back to the normal pace.');
+      await alertOnce(null, 'CHECKS RESUMED', `Back to ${watch}.`);
     }
 
     checks += 1;
@@ -524,35 +531,43 @@ async function runLive(cfg) {
     if (complete || stable) {
       if (!complete) log(`List stable at ${passers.length} names across two checks; treating it as final.`);
       const gCount = passers.filter((p) => p.surname.toUpperCase().startsWith(cfg.prefix)).length;
-      await alertOnce('list-complete', 'complete list detected',
-        `${passers.length} passers parsed, ${gCount} with ${cfg.prefix} surnames. Sending the list now.`);
+      await alertOnce('list-complete',
+        `RESULTS RELEASED · ${withCommas(passers.length)} passers`,
+        `${cfg.prefix} surnames: ${gCount} · sending now`,
+        true);
       const delivered = await deliverList(cfg, passers, cfg.stateFile);
       if (delivered) return 'delivered';
       lastStatus = `The full list is live (${passers.length} passers) but Telegram delivery failed; retrying.`;
+      shortStatus = `Released · ${withCommas(passers.length)} passers · delivery failed, retrying`;
       log(lastStatus);
-      await alertOnce('delivery-failed', 'Telegram delivery failed',
-        'The complete list is ready but sending it failed. Retrying on every check; the list is also saved as a run artifact.');
+      await alertOnce('delivery-failed', 'DELIVERY FAILED · list is ready',
+        'Retrying on every check; also saved as a run artifact.');
       return 60000;
     }
 
     if (passers.length >= MIN_PASSERS) {
       lastStatus = `Found ${passers.length} names; confirming stability on the next check.`;
+      shortStatus = `List appearing · ${withCommas(passers.length)} names · confirming`;
     } else if (passers.length > 0) {
       lastStatus = `List is appearing (${passers.length} names so far); waiting for it to complete.`;
+      shortStatus = `List appearing · ${withCommas(passers.length)} names so far · ${watch}`;
       missingNotices = 0;
       alerted.delete('format-change');
-      await alertOnce('names-appeared', 'names are appearing',
-        `${passers.length} passer names parsed so far. The ${cfg.prefix}-surname list goes out the moment the roster is complete.`);
+      await alertOnce('names-appeared',
+        `NAMES APPEARING · ${withCommas(passers.length)} so far`,
+        `${cfg.prefix} list sends automatically when the roster is complete.`);
     } else if (standby) {
       lastStatus = 'Still "Stand by for results!" - no names yet.';
+      shortStatus = `Not released yet · ${watch}`;
       missingNotices = 0;
       alerted.delete('format-change');
     } else {
       lastStatus = 'The standby notice is gone but no passer names parsed yet.';
+      shortStatus = `Page changed · no names parsed yet · ${watch}`;
       missingNotices += 1;
       if (missingNotices >= 3) {
-        await alertOnce('format-change', 'could not read the list',
-          `The page no longer says "Stand by for results", but ${missingNotices} checks in a row parsed no names. Please look manually: ${cfg.pageUrl}`);
+        await alertOnce('format-change', 'CANNOT READ THE LIST',
+          `Standby notice gone but ${missingNotices} checks in a row parsed no names.`, true);
       }
     }
 
@@ -575,7 +590,6 @@ async function runLive(cfg) {
 
     if (Date.now() >= nextPing) {
       const sent = await ping();
-      firstPing = false;
       nextPing = Date.now() + (sent ? cfg.heartbeatMs : 60000);
     }
 
@@ -636,7 +650,7 @@ async function runMonitor(options, cfg) {
         log(`Results confirmed: ${passers.length} passers, ${gPassers.length} matching "${cfg.prefix}". Saved ${TXT_FILE} and ${JSON_FILE}.`);
         if (!options.noSend) {
           try {
-            const messages = await sendList(meta, gPassers, cfg.pageUrl);
+            const messages = await sendList(meta, gPassers);
             log(`Sent ${messages} Telegram message(s).`);
           } catch (error) {
             log(`Telegram delivery failed: ${error.message}. The list is saved in ${TXT_FILE}.`);
