@@ -1,0 +1,7 @@
+.env
+monitor.log
+monitor.stdout.log
+monitor.stderr.log
+monitor.pid
+passers-g.txt
+passers-g.json

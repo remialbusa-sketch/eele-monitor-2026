@@ -1,0 +1,54 @@
+name: EELE October 2026 mailbox
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eele-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check results and send Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          POLL_SECONDS: '120'
+          SENT_STATE_FILE: sent-state.json
+        run: node monitor-ele.js --cloud
+
+      - name: Save delivered marker
+        if: success()
+        run: |
+          if [ -f sent-state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add sent-state.json
+            git diff --cached --quiet || git commit -m "Mark EELE list as delivered [skip ci]"
+            git push
+          fi
+
+      - name: Upload extracted list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eele-g-passers
+          path: |
+            passers-g.txt
+            passers-g.json
+          if-no-files-found: ignore
+          retention-days: 7
