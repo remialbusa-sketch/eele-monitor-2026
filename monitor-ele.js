@@ -276,6 +276,59 @@ async function runOnce(options, cfg) {
   return gPassers.length;
 }
 
+async function ensureTelegramConfig() {
+  const env = getEnv();
+  if (!(env.TELEGRAM_BOT_TOKEN || '').trim()) throw new Error('TELEGRAM_BOT_TOKEN secret is missing');
+  if (!(env.TELEGRAM_CHAT_ID || '').trim()) throw new Error('TELEGRAM_CHAT_ID secret is missing');
+  const me = await telegram('getMe');
+  log(`Telegram bot ready: @${me.username}`);
+  return me;
+}
+
+async function runHeartbeat(cfg) {
+  const stateFile = path.resolve(DIR, (getEnv().SENT_STATE_FILE || 'sent-state.json').trim());
+  if (fs.existsSync(stateFile)) {
+    log('Already delivered; heartbeat skipped.');
+    return;
+  }
+
+  const checkedAt = new Intl.DateTimeFormat('en-PH', {
+    dateStyle: 'medium',
+    timeStyle: 'medium',
+    timeZone: 'Asia/Manila',
+  }).format(new Date());
+
+  let status;
+  try {
+    const html = await fetchPage(cfg.pageUrl);
+    const { passers, complete } = parsePassers(html);
+    if (complete) {
+      const gCount = passers.filter((p) => p.surname.toUpperCase().startsWith(cfg.prefix)).length;
+      status = `Results are live: ${passers.length} passers parsed, ${gCount} with ${cfg.prefix} surnames. The delivery job should send the list within a few minutes.`;
+    } else if (passers.length > 0) {
+      status = `List is appearing (${passers.length} names so far); waiting for it to complete.`;
+    } else {
+      status = 'Still waiting: no passer names on the page yet.';
+    }
+  } catch (error) {
+    status = `Could not check the page: ${error.message}. The next run will retry.`;
+  }
+
+  const runUrl = (getEnv().GITHUB_RUN_URL || '').trim();
+  const message = [
+    'EELE monitor heartbeat',
+    'GitHub Actions is running normally.',
+    `Checked: ${checkedAt} (Asia/Manila)`,
+    'Site checks: every 5 minutes. Updates: every 10 minutes.',
+    status,
+    runUrl ? `Run details: ${runUrl}` : '',
+  ].filter(Boolean).join('\n');
+
+  const chatId = await resolveChatId();
+  await telegram('sendMessage', { chat_id: chatId, text: message, disable_web_page_preview: true });
+  log(`Heartbeat sent: ${status}`);
+}
+
 async function runCloud(cfg) {
   const stateFile = path.resolve(DIR, (getEnv().SENT_STATE_FILE || 'sent-state.json').trim());
   if (fs.existsSync(stateFile)) {
@@ -420,6 +473,7 @@ async function main() {
   const options = {
     once: args.includes('--once'),
     cloud: args.includes('--cloud'),
+    heartbeat: args.includes('--heartbeat'),
     noSend: args.includes('--no-send'),
     testMessage: args.includes('--test-message'),
   };
@@ -443,22 +497,22 @@ async function main() {
     return;
   }
 
-  await checkTelegramSetup();
-
-  if (options.cloud) {
+  if (options.cloud || options.heartbeat) {
     try {
-      const env = getEnv();
-      if (!(env.TELEGRAM_BOT_TOKEN || '').trim()) throw new Error('TELEGRAM_BOT_TOKEN secret is missing');
-      if (!(env.TELEGRAM_CHAT_ID || '').trim()) throw new Error('TELEGRAM_CHAT_ID secret is missing');
-      const me = await telegram('getMe');
-      log(`Telegram bot ready: @${me.username}`);
-      await runCloud(cfg);
+      await ensureTelegramConfig();
+      if (options.heartbeat) {
+        await runHeartbeat(cfg);
+      } else {
+        await runCloud(cfg);
+      }
     } catch (error) {
       log(`Cloud check failed: ${error.message}`);
       process.exitCode = 1;
     }
     return;
   }
+
+  await checkTelegramSetup();
 
   if (options.once) {
     try {
