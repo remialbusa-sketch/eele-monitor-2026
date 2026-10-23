@@ -3,6 +3,9 @@ name: EELE October 2026 mailbox
 on:
   schedule:
     - cron: '*/5 * * * *'
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
