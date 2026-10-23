@@ -1,0 +1,28 @@
+name: Supersede stale monitor runs
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  actions: write
+
+jobs:
+  supersede:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cancel live monitor runs from older commits
+        shell: bash
+        run: |
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow eele-monitor.yml --status in_progress \
+            --json databaseId,headSha --limit 20 \
+            | jq -r --arg sha "$GITHUB_SHA" '.[] | select(.headSha != $sha) | .databaseId' \
+            | while read -r run_id; do
+                [ -n "$run_id" ] || continue
+                echo "Cancelling stale live monitor run $run_id"
+                gh run cancel "$run_id" --repo "$GITHUB_REPOSITORY" || true
+              done

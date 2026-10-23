@@ -21,8 +21,9 @@ jobs:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      POLL_SECONDS: '180'
-      HEARTBEAT_SECONDS: '600'
+      POLL_SECONDS: '20'
+      HEARTBEAT_SECONDS: '300'
+      FORCE_FETCH_SECONDS: '300'
       MAX_HOURS: '5.25'
       SENT_STATE_FILE: sent-state.json
       GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -50,7 +51,7 @@ jobs:
             echo "Stop date reached; not queueing another run."
           fi
 
-      - name: Monitor every 3 minutes, update Telegram every 10
+      - name: Monitor every 20 seconds, ping Telegram every 5 minutes
         run: node monitor-ele.js --live
 
       - name: Save delivered marker
