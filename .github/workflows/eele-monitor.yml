@@ -1,8 +1,6 @@
-name: EELE October 2026 mailbox
+name: EELE October 2026 live monitor
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   push:
     branches:
       - main
@@ -10,15 +8,26 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
-  group: eele-monitor
+  group: eele-live
   cancel-in-progress: false
 
 jobs:
-  check:
+  live:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      POLL_SECONDS: '180'
+      HEARTBEAT_SECONDS: '600'
+      MAX_HOURS: '5.25'
+      SENT_STATE_FILE: sent-state.json
+      GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      GH_TOKEN: ${{ github.token }}
+      STOP_DATE: '20261030'
     steps:
       - uses: actions/checkout@v4
 
@@ -26,23 +35,56 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Check results and send Telegram
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          POLL_SECONDS: '120'
-          SENT_STATE_FILE: sent-state.json
-        run: node monitor-ele.js --cloud
-
-      - name: Save delivered marker
-        if: success()
+      - name: Queue the next live window
+        continue-on-error: true
+        shell: bash
         run: |
           if [ -f sent-state.json ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add sent-state.json
-            git diff --cached --quiet || git commit -m "Mark EELE list as delivered [skip ci]"
-            git push
+            echo "List already delivered; not queueing another run."
+            exit 0
+          fi
+          if [ "$(date -u +%Y%m%d)" \< "$STOP_DATE" ]; then
+            gh workflow run eele-monitor.yml --ref main
+            echo "Queued the next live window."
+          else
+            echo "Stop date reached; not queueing another run."
+          fi
+
+      - name: Monitor every 3 minutes, update Telegram every 10
+        run: node monitor-ele.js --live
+
+      - name: Save delivered marker
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f sent-state.json ]; then
+            echo "Nothing delivered yet; no marker to save."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sent-state.json
+          if git diff --cached --quiet; then
+            echo "Marker already committed."
+            exit 0
+          fi
+          git commit -m "Mark EELE list as delivered [skip ci]"
+          git push
+
+      - name: Queue another live window if not delivered
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ -f sent-state.json ]; then
+            echo "List already delivered; not queueing another run."
+            exit 0
+          fi
+          if [ "$(date -u +%Y%m%d)" \< "$STOP_DATE" ]; then
+            gh workflow run eele-monitor.yml --ref main
+            echo "Queued the next live window."
+          else
+            echo "Stop date reached; not queueing another run."
           fi
 
       - name: Upload extracted list

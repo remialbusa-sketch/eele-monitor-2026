@@ -48,7 +48,9 @@ function config() {
     pageUrl: (e.PAGE_URL || DEFAULT_URL).trim(),
     prefix: (e.SURNAME_PREFIX || 'G').trim().toUpperCase(),
     pollMs: Math.max(60, num(e.POLL_SECONDS, 120)) * 1000,
+    heartbeatMs: Math.max(60, num(e.HEARTBEAT_SECONDS, 600)) * 1000,
     maxHours: num(e.MAX_HOURS, 24),
+    stateFile: path.resolve(DIR, (e.SENT_STATE_FILE || 'sent-state.json').trim()),
   };
 }
 
@@ -285,31 +287,54 @@ async function ensureTelegramConfig() {
   return me;
 }
 
-async function runHeartbeat(cfg) {
-  const stateFile = path.resolve(DIR, (getEnv().SENT_STATE_FILE || 'sent-state.json').trim());
-  if (fs.existsSync(stateFile)) {
-    log('Already delivered; heartbeat skipped.');
-    return;
+function readSentState(cfg) {
+  if (!fs.existsSync(cfg.stateFile)) return { stateFile: cfg.stateFile, state: null };
+  try {
+    const state = JSON.parse(fs.readFileSync(cfg.stateFile, 'utf8'));
+    if (!state || (state.source && state.source !== cfg.pageUrl)) {
+      return { stateFile: cfg.stateFile, state: null };
+    }
+    return { stateFile: cfg.stateFile, state };
+  } catch {
+    return { stateFile: cfg.stateFile, state: null };
   }
+}
 
-  const checkedAt = new Intl.DateTimeFormat('en-PH', {
+function pageStatus(passers, complete, prefix) {
+  if (complete) {
+    const count = passers.filter((p) => p.surname.toUpperCase().startsWith(prefix)).length;
+    return `Results are live: ${passers.length} passers parsed, ${count} with ${prefix} surnames.`;
+  }
+  if (passers.length > 0) {
+    return `List is appearing (${passers.length} names so far); waiting for it to complete.`;
+  }
+  return 'Still waiting: no passer names on the page yet.';
+}
+
+function manilaTime(date = new Date()) {
+  return new Intl.DateTimeFormat('en-PH', {
     dateStyle: 'medium',
     timeStyle: 'medium',
     timeZone: 'Asia/Manila',
-  }).format(new Date());
+  }).format(date);
+}
+
+function minutesLabel(ms) {
+  const minutes = ms / 60000;
+  return Number.isInteger(minutes) ? `${minutes}` : minutes.toFixed(1);
+}
+
+async function runHeartbeat(cfg) {
+  if (readSentState(cfg).state) {
+    log('Already delivered; heartbeat skipped.');
+    return;
+  }
 
   let status;
   try {
     const html = await fetchPage(cfg.pageUrl);
     const { passers, complete } = parsePassers(html);
-    if (complete) {
-      const gCount = passers.filter((p) => p.surname.toUpperCase().startsWith(cfg.prefix)).length;
-      status = `Results are live: ${passers.length} passers parsed, ${gCount} with ${cfg.prefix} surnames. The delivery job should send the list within a few minutes.`;
-    } else if (passers.length > 0) {
-      status = `List is appearing (${passers.length} names so far); waiting for it to complete.`;
-    } else {
-      status = 'Still waiting: no passer names on the page yet.';
-    }
+    status = pageStatus(passers, complete, cfg.prefix);
   } catch (error) {
     status = `Could not check the page: ${error.message}. The next run will retry.`;
   }
@@ -318,8 +343,8 @@ async function runHeartbeat(cfg) {
   const message = [
     'EELE monitor heartbeat',
     'GitHub Actions is running normally.',
-    `Checked: ${checkedAt} (Asia/Manila)`,
-    'Site checks: every 5 minutes. Updates: every 10 minutes.',
+    `Checked: ${manilaTime()} (Asia/Manila)`,
+    `Site checks: every ${minutesLabel(cfg.pollMs)} minutes. Updates: every ${minutesLabel(cfg.heartbeatMs)} minutes.`,
     status,
     runUrl ? `Run details: ${runUrl}` : '',
   ].filter(Boolean).join('\n');
@@ -329,19 +354,70 @@ async function runHeartbeat(cfg) {
   log(`Heartbeat sent: ${status}`);
 }
 
-async function runCloud(cfg) {
-  const stateFile = path.resolve(DIR, (getEnv().SENT_STATE_FILE || 'sent-state.json').trim());
-  if (fs.existsSync(stateFile)) {
-    let state = null;
+async function sendLiveHeartbeat(cfg, status, checkedAt, first) {
+  if (readSentState(cfg).state) return true;
+
+  const runUrl = (getEnv().GITHUB_RUN_URL || '').trim();
+  const message = [
+    first ? 'EELE live monitor started on GitHub Actions.' : 'EELE monitor heartbeat',
+    first
+      ? `This is the first check-in. The list will be sent here automatically once the complete roster appears; updates follow every ${minutesLabel(cfg.heartbeatMs)} minutes.`
+      : `The monitor is still running; the list will be sent automatically when it is complete.`,
+    `Checked: ${checkedAt ? manilaTime(checkedAt) : 'starting now'} (Asia/Manila)`,
+    `Checks: every ${minutesLabel(cfg.pollMs)} minutes. Updates: every ${minutesLabel(cfg.heartbeatMs)} minutes.`,
+    `Status: ${status}`,
+    runUrl ? `Run details: ${runUrl}` : '',
+  ].filter(Boolean).join('\n');
+
+  try {
+    const chatId = await resolveChatId();
+    await telegram('sendMessage', { chat_id: chatId, text: message, disable_web_page_preview: true });
+    log(`Heartbeat sent: ${status}`);
+    return true;
+  } catch (error) {
+    log(`Heartbeat failed: ${error.message}`);
+    return false;
+  }
+}
+
+async function deliverList(cfg, passers, stateFile) {
+  const gPassers = passers.filter((p) => p.surname.toUpperCase().startsWith(cfg.prefix));
+  const meta = {
+    source: cfg.pageUrl,
+    prefix: cfg.prefix,
+    detectedAt: new Date().toISOString(),
+    totalPassers: passers.length,
+  };
+  writeResults(meta, gPassers);
+  log(`Complete list found: ${passers.length} passers, ${gPassers.length} matching "${cfg.prefix}". Saved ${TXT_FILE} and ${JSON_FILE}.`);
+
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-    } catch {
-      state = null;
+      const messages = await sendList(meta, gPassers, cfg.pageUrl);
+      fs.writeFileSync(stateFile, `${JSON.stringify({
+        source: cfg.pageUrl,
+        deliveredAt: meta.detectedAt,
+        totalPassers: passers.length,
+        matchingPassers: gPassers.length,
+      }, null, 2)}\n`, 'utf8');
+      log(`Sent ${messages} Telegram message(s) and wrote ${stateFile}.`);
+      return true;
+    } catch (error) {
+      lastError = error;
+      log(`Telegram attempt ${attempt}/3 failed: ${error.message}`);
+      if (attempt < 3) await sleep(15000);
     }
-    if (state && (!state.source || state.source === cfg.pageUrl)) {
-      log(`Already delivered at ${state.deliveredAt || 'an earlier run'}; nothing to do.`);
-      return;
-    }
+  }
+  log(`Telegram delivery failed after 3 attempts: ${lastError.message}`);
+  return false;
+}
+
+async function runCloud(cfg) {
+  const { state } = readSentState(cfg);
+  if (state) {
+    log(`Already delivered at ${state.deliveredAt || 'an earlier run'}; nothing to do.`);
+    return;
   }
 
   log(`Checking ${cfg.pageUrl}`);
@@ -356,35 +432,64 @@ async function runCloud(cfg) {
     return;
   }
 
-  const gPassers = passers.filter((p) => p.surname.toUpperCase().startsWith(cfg.prefix));
-  const meta = {
-    source: cfg.pageUrl,
-    prefix: cfg.prefix,
-    detectedAt: new Date().toISOString(),
-    totalPassers: passers.length,
-  };
-  writeResults(meta, gPassers);
-  log(`Found ${passers.length} passers, ${gPassers.length} matching "${cfg.prefix}". Saved ${TXT_FILE} and ${JSON_FILE}.`);
+  const delivered = await deliverList(cfg, passers, cfg.stateFile);
+  if (!delivered) throw new Error('Telegram delivery failed after 3 attempts');
+}
 
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const messages = await sendList(meta, gPassers, cfg.pageUrl);
-      fs.writeFileSync(stateFile, `${JSON.stringify({
-        source: cfg.pageUrl,
-        deliveredAt: meta.detectedAt,
-        totalPassers: passers.length,
-        matchingPassers: gPassers.length,
-      }, null, 2)}\n`, 'utf8');
-      log(`Sent ${messages} Telegram message(s) and wrote ${stateFile}.`);
-      return;
-    } catch (error) {
-      lastError = error;
-      log(`Telegram attempt ${attempt}/3 failed: ${error.message}`);
-      if (attempt < 3) await sleep(15000);
-    }
+async function runLive(cfg) {
+  const { state } = readSentState(cfg);
+  if (state) {
+    log(`Already delivered at ${state.deliveredAt || 'an earlier run'}; live monitor exiting.`);
+    return;
   }
-  throw lastError;
+
+  const deadline = Date.now() + cfg.maxHours * 3600 * 1000;
+  let lastStatus = 'The first page check has not finished yet.';
+  let lastCheckedAt = null;
+  let firstHeartbeat = true;
+  let nextHeartbeat = Date.now();
+  let nextPoll = Date.now();
+
+  while (Date.now() < deadline) {
+    if (Date.now() >= nextPoll) {
+      nextPoll = Date.now() + cfg.pollMs;
+      try {
+        const html = await fetchPage(cfg.pageUrl);
+        const { passers, complete } = parsePassers(html);
+        lastCheckedAt = new Date();
+        if (complete) {
+          const delivered = await deliverList(cfg, passers, cfg.stateFile);
+          if (delivered) return;
+          lastStatus = `The full list is live (${passers.length} passers) but Telegram delivery failed; retrying on the next check.`;
+        } else {
+          lastStatus = pageStatus(passers, complete, cfg.prefix);
+        }
+        log(lastStatus);
+      } catch (error) {
+        lastStatus = `Could not check the page: ${error.message}`;
+        log(`${lastStatus}. Retrying in ${Math.round(cfg.pollMs / 1000)}s.`);
+      }
+    }
+
+    if (Date.now() >= nextHeartbeat) {
+      const sent = await sendLiveHeartbeat(cfg, lastStatus, lastCheckedAt, firstHeartbeat);
+      firstHeartbeat = false;
+      nextHeartbeat = Date.now() + (sent ? cfg.heartbeatMs : 60000);
+    }
+
+    if (readSentState(cfg).state) {
+      log('Another run marked the list as delivered; live monitor exiting.');
+      return;
+    }
+
+    const now = Date.now();
+    const remaining = deadline - now;
+    if (remaining <= 0) break;
+    const nextDue = Math.min(nextPoll, nextHeartbeat);
+    await sleep(Math.max(500, Math.min(nextDue - now, remaining)));
+  }
+
+  log(`Live window ended after ${cfg.maxHours} hour(s) without delivering the list.`);
 }
 
 async function runMonitor(options, cfg) {
@@ -473,6 +578,7 @@ async function main() {
   const options = {
     once: args.includes('--once'),
     cloud: args.includes('--cloud'),
+    live: args.includes('--live'),
     heartbeat: args.includes('--heartbeat'),
     noSend: args.includes('--no-send'),
     testMessage: args.includes('--test-message'),
@@ -497,10 +603,12 @@ async function main() {
     return;
   }
 
-  if (options.cloud || options.heartbeat) {
+  if (options.live || options.cloud || options.heartbeat) {
     try {
       await ensureTelegramConfig();
-      if (options.heartbeat) {
+      if (options.live) {
+        await runLive(cfg);
+      } else if (options.heartbeat) {
         await runHeartbeat(cfg);
       } else {
         await runCloud(cfg);
