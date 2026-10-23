@@ -446,6 +446,7 @@ async function runLive(cfg) {
   const deadline = Date.now() + cfg.maxHours * 3600 * 1000;
   let lastStatus = 'The first page check has not finished yet.';
   let lastCheckedAt = null;
+  let lastSig = null;
   let firstHeartbeat = true;
   let nextHeartbeat = Date.now();
   let nextPoll = Date.now();
@@ -457,13 +458,20 @@ async function runLive(cfg) {
         const html = await fetchPage(cfg.pageUrl);
         const { passers, complete } = parsePassers(html);
         lastCheckedAt = new Date();
-        if (complete) {
+        const sig = passers.length ? signature(passers) : null;
+        // A page typo can break the sequence check, so a stable full-size list also counts as final.
+        const stable = sig && passers.length >= MIN_PASSERS && sig === lastSig;
+        if (complete || stable) {
+          if (!complete) log(`List stable at ${passers.length} names across two checks; treating it as final.`);
           const delivered = await deliverList(cfg, passers, cfg.stateFile);
           if (delivered) return;
           lastStatus = `The full list is live (${passers.length} passers) but Telegram delivery failed; retrying on the next check.`;
+        } else if (passers.length >= MIN_PASSERS) {
+          lastStatus = `Found ${passers.length} names; confirming stability on the next check.`;
         } else {
           lastStatus = pageStatus(passers, complete, cfg.prefix);
         }
+        lastSig = sig;
         log(lastStatus);
       } catch (error) {
         lastStatus = `Could not check the page: ${error.message}`;
